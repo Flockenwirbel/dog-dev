@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Goalkeeper: walk to 30cm in front of goal_left using reference VRPN framework."""
+"""Goalkeeper: approach goal_left at 2m/s, then turn sideways (body parallel to goal line)."""
 
 import math
 import subprocess
@@ -11,75 +11,47 @@ from protocol.srv import MotionResultCmd
 from rclpy.node import Node
 
 from .vrpn_perception import (
-    SLOW_TROT,
-    MEDIUM_TROT,
     CMD_DATA,
+    FAST_TROT,
     GAIT_STANDARD,
+    SLOW_TROT,
     VrpnPerception,
-    MotionCmd,
     clamp,
     norm_angle,
 )
 
-
 DOG_NAMESPACE = "mi_desktop_48_b0_2d_7b_06_3f"
 GOAL_DISTANCE = 0.3
-
-
-def _to_body(wx, wy, cyaw, syaw):
-    """World→body frame: (forward, left). Same as reference approach_controller."""
-    return (wx * cyaw + wy * syaw, -wx * syaw + wy * cyaw)
+APPROACH_SPEED = 0.5
+ARRIVE_TOL = 0.5
+GOAL_HALF_WIDTH = 0.70
+GOALKEEPER_HALF_RANGE = 0.4
 
 
 class Goalkeeper(Node):
+    GO_AROUND = "go_around"
+    APPROACH = "approach"
+    READY = "ready"
+    KICK = "kick"
+
     def __init__(self):
         super().__init__("goalkeeper")
 
-        # ---- Same parameter style as reference ball_kicker ----
-        self.declare_parameter("dog_name", DOG_NAMESPACE)
-        self.declare_parameter("ball_tracker", "ball")
-        self.declare_parameter("dog_tracker", "LYT")
         self.declare_parameter("goal_tracker", "goal_left")
-        self.declare_parameter("forward_yaw_axis", "x")
-        self.declare_parameter("yaw_proj_min", 0.10)
-        self.declare_parameter("yaw_filter_alpha", 0.35)
-        self.declare_parameter("approach_speed", 0.25)
-        self.declare_parameter("yaw_gain", 0.5)
-        self.declare_parameter("max_yaw_rate", 0.5)
-        self.declare_parameter("goal_distance", 0.3)
+        goal_tracker = self.get_parameter("goal_tracker").value
 
-        p = self.get_parameter
-        self.dog_name = p("dog_name").value
-        self.approach_speed = float(p("approach_speed").value)
-        self.yaw_gain = float(p("yaw_gain").value)
-        self.max_yaw_rate = float(p("max_yaw_rate").value)
-        self.goal_distance = float(p("goal_distance").value)
-
-        # ---- VRPN perception (same as reference) ----
         self.perception = VrpnPerception(
-            node=self,
-            ball_tracker=p("ball_tracker").value,
-            dog_tracker=p("dog_tracker").value,
-            goal_tracker=p("goal_tracker").value,
-            yaw_axis=str(p("forward_yaw_axis").value).lower(),
-            yaw_proj_min=float(p("yaw_proj_min").value),
-            yaw_alpha=clamp(float(p("yaw_filter_alpha").value), 0.0, 1.0),
+            node=self, ball_tracker="ball", dog_tracker="LYT",
+            goal_tracker=goal_tracker, yaw_axis="x", yaw_alpha=0.35,
         )
-
-        self.goal_fixed_xy = (0.0, -4.5)
-
-        # ---- Motion publisher (same as reference) ----
-        self.pub_cmd = self.create_publisher(
-            MotionServoCmd,
-            "/{}/motion_servo_cmd".format(self.dog_name),
-            10,
+        self.get_logger().info("Defending goal: {}".format(goal_tracker))
+        self.cmd_pub = self.create_publisher(
+            MotionServoCmd, "/{}/motion_servo_cmd".format(DOG_NAMESPACE), 10
         )
-
-        # ---- Stand up first ----
         self.stand_client = self.create_client(
-            MotionResultCmd,
-            "/{}/motion_result_cmd".format(self.dog_name),
+            MotionResultCmd, "/{}/motion_result_cmd".format(DOG_NAMESPACE)
         )
+
         self.get_logger().info("Standing up...")
         self.stand_client.wait_for_service(timeout_sec=5.0)
         req = MotionResultCmd.Request()
@@ -88,105 +60,175 @@ class Goalkeeper(Node):
         req.step_height = [0.05, 0.05]
         self.stand_client.call_async(req)
 
+        self.state = self.GO_AROUND
         self.start_time = time.monotonic()
-        self.create_timer(0.1, self._tick)
-        self.get_logger().info("Goalkeeper started.")
+        self.create_timer(0.05, self._tick)
 
-    def _cmd(self, cmd):
+        self.close_frames = 0
+        self.kick_start = 0.0
+
+    def _send(self, gait, vx, vy, vyaw):
         msg = MotionServoCmd()
-        msg.motion_id = int(cmd.gait)
+        msg.motion_id = gait
         msg.cmd_type = CMD_DATA
         msg.value = GAIT_STANDARD
-        msg.vel_des = [float(cmd.vx), float(cmd.vy), float(cmd.vyaw)]
+        msg.vel_des = [float(vx), float(vy), float(vyaw)]
         msg.step_height = [0.05, 0.05]
-        self.pub_cmd.publish(msg)
+        self.cmd_pub.publish(msg)
+
+    def _to_body(self, wx, wy, dog_yaw):
+        cyaw = math.cos(dog_yaw)
+        syaw = math.sin(dog_yaw)
+        return wx * cyaw + wy * syaw, -wx * syaw + wy * cyaw
 
     def _tick(self):
         now = time.monotonic()
         if now - self.start_time < 3.0:
             return
 
-        snapshot = self.perception.snapshot(self.goal_fixed_xy)
-        if snapshot is None:
-            self._log("Waiting VRPN snapshot, keep stepping in place")
-            self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
+        p = self.perception
+        if not p.ready():
+            self.get_logger().warn("Waiting VRPN...")
             return
-
-        stale = self.perception.stale_items(now, max_age=2.0)
-        stale = [item for item in stale if not item.startswith("goal(")]
+        stale = p.stale(now)
         if stale:
-            self._log("Stale VRPN: {}".format(" ".join(stale)))
-            self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
+            self.get_logger().warn("Stale: {}".format(" ".join(stale)))
+            self._send(SLOW_TROT, 0.0, 0.0, 0.0)
             return
 
-        s = snapshot
-        goal_x, goal_y = s.goal_x, s.goal_y
-        dog_x, dog_y = s.dog_x, s.dog_y
-        dog_yaw = s.dog_yaw
+        dog_x, dog_y = p.dog_xy
+        dog_yaw = p.dog_yaw
+        goal_x, goal_y = p.goal_xy
+        ball_x, ball_y = p.ball_xy
+        ball_dist = math.hypot(ball_x - dog_x, ball_y - dog_y)
 
-        # ---- Target: goal_left position + 30cm toward field ----
-        # Use ball to determine which side is the field
-        ball_x, ball_y = s.ball_x, s.ball_y
-        gx = ball_x - goal_x
-        gy = ball_y - goal_y
-        g_dist = math.hypot(gx, gy)
+        # Field direction: fixed +y
+        ux, uy = 0.0, 1.0
 
-        if g_dist < 1e-6:
-            self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
-            return
+        # Goal line direction (perpendicular to field_dir)
+        glx, gly = -uy, ux  # (-1, 0) → goal line along x-axis
 
-        ux = gx / g_dist
-        uy = gy / g_dist
+        # Target: 30cm from goal toward field (center)
+        target_x = goal_x + ux * GOAL_DISTANCE
+        target_y = goal_y + uy * GOAL_DISTANCE
 
-        target_x = goal_x + ux * self.goal_distance
-        target_y = goal_y + uy * self.goal_distance
-
+        # Errors in field_dir frame
         dx = target_x - dog_x
         dy = target_y - dog_y
         dist = math.hypot(dx, dy)
 
-        if dist < 0.05:
-            self.get_logger().info("On target. dist={:.3f}".format(dist))
-            self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
+        # Desired yaw: body parallel to goal line
+        desired_yaw_align = math.atan2(uy, ux) + math.pi / 2.0
+
+        if self.state == self.GO_AROUND:
+            if dog_y >= goal_y + 1.0:
+                self.get_logger().info("Already in front of goal, skip GO_AROUND")
+                self.state = self.APPROACH
+                return
+
+            waypoint_x = dog_x
+            waypoint_y = goal_y + 0.6
+
+            wdx = waypoint_x - dog_x
+            wdy = waypoint_y - dog_y
+            wdist = math.hypot(wdx, wdy)
+
+            if wdist < 0.2:
+                self.get_logger().info("GO_AROUND reached waypoint, switching to APPROACH")
+                self.state = self.APPROACH
+                return
+
+            wx = wdx / wdist * APPROACH_SPEED
+            wy = wdy / wdist * APPROACH_SPEED
+            vx_b, vy_b = self._to_body(wx, wy, dog_yaw)
+            self._send(SLOW_TROT, vx_b, vy_b, 0.0)
+            self.get_logger().info(
+                "[GO_AROUND] waypoint=({:.2f},{:.2f}) dist={:.2f} bv=({:.2f},{:.2f})".format(
+                    waypoint_x, waypoint_y, wdist, vx_b, vy_b))
             return
 
-        # World frame velocity toward target (same as reference approach_controller)
-        speed = self.approach_speed
-        if dist > 1e-6:
-            tow_x = dx / dist * speed
-            tow_y = dy / dist * speed
-        else:
-            tow_x, tow_y = 0.0, 0.0
+        elif self.state == self.APPROACH:
+            if dist < ARRIVE_TOL:
+                self.get_logger().info("Arrived! Switching to READY")
+                self.state = self.READY
+                return
+            wx = dx / dist * APPROACH_SPEED
+            wy = dy / dist * APPROACH_SPEED
+            vx_b, vy_b = self._to_body(wx, wy, dog_yaw)
+            self._send(FAST_TROT, vx_b, vy_b, 0.0)
+            self.get_logger().info(
+                "[APPROACH] dist={:.2f} bv=({:.2f},{:.2f}) yaw={:.1f}".format(
+                    dist, vx_b, vy_b, math.degrees(dog_yaw)))
 
-        # World -> body (same as reference)
-        cyaw = math.cos(dog_yaw)
-        syaw = math.sin(dog_yaw)
-        vx_body, vy_body = _to_body(tow_x, tow_y, cyaw, syaw)
+        elif self.state == self.READY:
+            # Count consecutive frames where ball is close to dog
+            if ball_y < goal_y:
+                self.close_frames = 0
+            elif ball_dist < 1.0:
+                self.close_frames += 1
+            else:
+                self.close_frames = 0
 
-        # Face toward target
-        desired_yaw = math.atan2(dy, dx)
-        yaw_err = norm_angle(desired_yaw - dog_yaw)
-        vyaw = clamp(self.yaw_gain * yaw_err, -self.max_yaw_rate, self.max_yaw_rate)
+            if self.close_frames >= 3:
+                self.get_logger().info("Ball blocked! Kicking away...")
+                self.state = self.KICK
+                self.kick_start = now
+                return
 
-        self._cmd(MotionCmd(SLOW_TROT, vx_body, vy_body, vyaw))
+            # Predict where ball crosses goal line, track that laterally
+            intercept_x = p.predict_intercept_x(goal_y)
+            if intercept_x is not None:
+                ball_proj = goal_x - intercept_x
+            else:
+                ball_proj = (ball_x - goal_x) * glx + (ball_y - goal_y) * gly
+            ball_proj = clamp(ball_proj, -GOAL_HALF_WIDTH, GOAL_HALF_WIDTH)
 
-        self.get_logger().info(
-            "[approach] dog=({:.2f},{:.2f}) target=({:.2f},{:.2f}) dist={:.2f} bv=({:.2f},{:.2f}) vyaw={:.2f} yaw={:.1f}".format(
-                dog_x, dog_y, target_x, target_y, dist,
-                vx_body, vy_body, vyaw, math.degrees(dog_yaw),
-            )
-        )
+            rtx = goal_x + glx * ball_proj + ux * GOAL_DISTANCE
+            rtx = clamp(rtx, goal_x - GOALKEEPER_HALF_RANGE, goal_x + GOALKEEPER_HALF_RANGE)
+            rty = goal_y + gly * ball_proj + uy * GOAL_DISTANCE
+            rdx = rtx - dog_x
+            rdy = rty - dog_y
+            rdist = math.hypot(rdx, rdy)
 
-    def _log(self, text, period_s=2.0):
-        now = time.monotonic()
-        if not hasattr(self, '_last_log_t'):
-            self._last_log_t = 0.0
-        if now - self._last_log_t > period_s:
-            self.get_logger().info(text)
-            self._last_log_t = now
+            yaw_err = norm_angle(desired_yaw_align - dog_yaw)
+            vyaw = clamp(0.8 * yaw_err, -1.0, 1.0)
+
+            if rdist > 0.01:
+                wx = clamp(1.2 * rdx, -1.0, 1.0)
+                wy = clamp(1.2 * rdy, -1.0, 1.0)
+                vx_b, vy_b = self._to_body(wx, wy, dog_yaw)
+                self._send(FAST_TROT, vx_b, vy_b, vyaw)
+            else:
+                self._send(FAST_TROT, 0.0, 0.0, vyaw)
+
+            self.get_logger().info(
+                "[READY] intercept={} ball_proj={:.2f} target=({:.2f},{:.2f}) rdist={:.3f} yaw_err={:.1f}deg".format(
+                    "({:.2f})".format(intercept_x) if intercept_x is not None else "none",
+                    ball_proj, rtx, rty, rdist, math.degrees(yaw_err)))
+
+        elif self.state == self.KICK:
+            if now - self.kick_start > 0.3 or ball_dist > 0.3:
+                self.get_logger().info("Kick done, back to READY")
+                self.state = self.READY
+                self.close_frames = 0
+                return
+
+            kdx = ball_x - dog_x
+            kdy = ball_y - dog_y
+            kdist = math.hypot(kdx, kdy)
+            if kdist > 0.01:
+                wx = kdx / kdist * 1.5
+                wy = kdy / kdist * 1.5
+            else:
+                wx, wy = 0.0, 1.5
+            vx_b, vy_b = self._to_body(wx, wy, dog_yaw)
+            self._send(FAST_TROT, vx_b, vy_b, 0.0)
+            self.get_logger().info(
+                "[KICK] ball=({:.2f},{:.2f}) dist={:.2f} bv=({:.2f},{:.2f})".format(
+                    ball_x, ball_y, kdist, vx_b, vy_b))
 
     def destroy_node(self):
-        self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
+        self._send(SLOW_TROT, 0.0, 0.0, 0.0)
         return super().destroy_node()
 
 
@@ -224,4 +266,5 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(args=sys.argv)

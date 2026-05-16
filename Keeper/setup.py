@@ -15,15 +15,12 @@ setup(
     zip_safe=True,
     maintainer='mi',
     maintainer_email='mi@todo.todo',
-    description='Goalkeeper patrol along goal line with VRPN motion capture',
+    description='Goalkeeper: walk to 30cm in front of goal, face field',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            "patrol = goalkeeper_pkg.goal_line_patrol:main",
-            "walk = goalkeeper_pkg.walk_to_goal:main",
-            "diag = goalkeeper_pkg.diag:main",
-            "gk = goalkeeper_pkg.goalkeeper:main",
+            'gk = goalkeeper_pkg.goalkeeper:main',
         ],
     },
 )
