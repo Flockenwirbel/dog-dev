@@ -1,27 +1,29 @@
 from setuptools import setup
 
-package_name = 'demo_python_pkg'
+package_name = 'goalkeeper_pkg'
 
 setup(
     name=package_name,
     version='0.0.0',
     packages=[package_name],
-    package_dir={'demo_python_pkg': '.'},
     data_files=[
         ('share/ament_index/resource_index/packages',
-            ['../resource/' + package_name]),
-        ('share/' + package_name, ['../package.xml']),
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='mi',
     maintainer_email='mi@todo.todo',
-    description='CyberDog goalkeeper',
+    description='Goalkeeper patrol along goal line with VRPN motion capture',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'goalkeeper = demo_python_pkg.run_goalkeeper:main',
+            "patrol = goalkeeper_pkg.goal_line_patrol:main",
+            "walk = goalkeeper_pkg.walk_to_goal:main",
+            "diag = goalkeeper_pkg.diag:main",
+            "gk = goalkeeper_pkg.goalkeeper:main",
         ],
     },
 )

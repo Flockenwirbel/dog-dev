@@ -1,6 +1,5 @@
-﻿#!/usr/bin/env python3
-"""VRPN perception: subscribes to motion-capture rigid-body poses and produces
-fused world-state snapshots including position and velocity."""
+#!/usr/bin/env python3
+"""VRPN perception and shared motion/perception data models."""
 
 import math
 import time
@@ -13,6 +12,9 @@ from rclpy.node import Node
 SLOW_TROT = 303
 FAST_TROT = 305
 MEDIUM_TROT = 308
+
+CMD_DATA = 1
+GAIT_STANDARD = 2
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -47,8 +49,6 @@ class PerceptionSnapshot:
         dog_yaw_z: float,
         ball_x: float,
         ball_y: float,
-        ball_vx: float,
-        ball_vy: float,
         goal_x: float,
         goal_y: float,
         goal_from_tracker: bool,
@@ -62,15 +62,13 @@ class PerceptionSnapshot:
         self.dog_yaw_z = dog_yaw_z
         self.ball_x = ball_x
         self.ball_y = ball_y
-        self.ball_vx = ball_vx
-        self.ball_vy = ball_vy
         self.goal_x = goal_x
         self.goal_y = goal_y
         self.goal_from_tracker = goal_from_tracker
 
 
 class VrpnPerception:
-    """VRPN subscriptions + fused world state with velocity tracking."""
+    """Part 1: VRPN subscriptions + fused world state."""
 
     def __init__(
         self,
@@ -81,15 +79,11 @@ class VrpnPerception:
         yaw_axis: str,
         yaw_proj_min: float,
         yaw_alpha: float,
-        yaw_offset: float = 0.0,
-        vel_smooth: float = 0.3,
     ) -> None:
         self.node = node
         self.yaw_axis = yaw_axis
         self.yaw_proj_min = yaw_proj_min
         self.yaw_alpha = yaw_alpha
-        self.yaw_offset = yaw_offset
-        self.vel_smooth = vel_smooth
 
         self.ball_xy: Optional[Tuple[float, float]] = None
         self.goal_xy: Optional[Tuple[float, float]] = None
@@ -106,12 +100,6 @@ class VrpnPerception:
         self.yaw_x: float = 0.0
         self.yaw_y: float = 0.0
         self.yaw_z: float = 0.0
-
-        # Velocity tracking state
-        self._ball_vx: float = 0.0
-        self._ball_vy: float = 0.0
-        self._prev_ball_xy: Optional[Tuple[float, float]] = None
-        self._prev_ball_t: float = 0.0
 
         node.create_subscription(
             PoseStamped,
@@ -133,23 +121,8 @@ class VrpnPerception:
         )
 
     def _on_ball(self, msg: PoseStamped) -> None:
-        now = time.monotonic()
-        new_x = msg.pose.position.x
-        new_y = msg.pose.position.y
-
-        if self.ball_xy is not None and self._prev_ball_t > 0.0:
-            dt = now - self._prev_ball_t
-            if dt > 1e-6:
-                raw_vx = (new_x - self.ball_xy[0]) / dt
-                raw_vy = (new_y - self.ball_xy[1]) / dt
-                alpha = min(1.0, dt / self.vel_smooth)
-                self._ball_vx += alpha * (raw_vx - self._ball_vx)
-                self._ball_vy += alpha * (raw_vy - self._ball_vy)
-
-        self.ball_xy = (new_x, new_y)
-        self._prev_ball_xy = self.ball_xy
-        self._prev_ball_t = now
-        self.ball_t = now
+        self.ball_xy = (msg.pose.position.x, msg.pose.position.y)
+        self.ball_t = time.monotonic()
 
     def _on_goal(self, msg: PoseStamped) -> None:
         self.goal_xy = (msg.pose.position.x, msg.pose.position.y)
@@ -157,7 +130,8 @@ class VrpnPerception:
         if not self.goal_logged:
             self.node.get_logger().info(
                 "[GOAL] VRPN goal at x={:.2f} y={:.2f}".format(
-                    self.goal_xy[0], self.goal_xy[1]
+                    self.goal_xy[0],
+                    self.goal_xy[1],
                 )
             )
             self.goal_logged = True
@@ -167,6 +141,7 @@ class VrpnPerception:
         self.dog_xy = (msg.pose.position.x, msg.pose.position.y)
         q = msg.pose.orientation
 
+        # Rotation matrix (body -> world), quaternion (x, y, z, w).
         r00 = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         r01 = 2.0 * (q.x * q.y - q.w * q.z)
         r02 = 2.0 * (q.x * q.z + q.w * q.y)
@@ -177,6 +152,7 @@ class VrpnPerception:
         r21 = 2.0 * (q.y * q.z + q.w * q.x)
         r22 = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
 
+        # XY plane heading candidates (0° = +X, +90° = +Y)
         self.yaw_x = math.atan2(r10, r00)
         self.yaw_y = math.atan2(r11, r01)
         self.yaw_z = math.atan2(r12, r02)
@@ -193,7 +169,9 @@ class VrpnPerception:
             if now - self.last_warn_t > 1.0:
                 self.node.get_logger().warn(
                     "[YAW] proj too small axis={} proj={:.3f} < {:.3f}".format(
-                        self.yaw_axis, proj, self.yaw_proj_min
+                        self.yaw_axis,
+                        proj,
+                        self.yaw_proj_min,
                     )
                 )
                 self.last_warn_t = now
@@ -205,7 +183,7 @@ class VrpnPerception:
         else:
             d = norm_angle(yaw_raw - self.dog_yaw)
             self.dog_yaw = norm_angle(self.dog_yaw + self.yaw_alpha * d)
-
+        
         self.dog_t = now
 
     def stale_items(self, now: float, max_age: float = 2.0) -> List[str]:
@@ -218,16 +196,12 @@ class VrpnPerception:
             items.append("dog({:.1f}s)".format(now - self.dog_t))
         return items
 
-    def snapshot(
-        self, goal_fallback_xy: Tuple[float, float]
-    ) -> Optional[PerceptionSnapshot]:
+    def snapshot(self, goal_fallback_xy: Tuple[float, float]) -> Optional[PerceptionSnapshot]:
         now = time.monotonic()
         if self.ball_xy is None or self.dog_xy is None or self.dog_yaw is None:
             return None
 
-        goal_from_tracker = (
-            self.goal_xy is not None and (now - self.goal_t) < 5.0
-        )
+        goal_from_tracker = self.goal_xy is not None and (now - self.goal_t) < 5.0
         if goal_from_tracker and self.goal_xy is not None:
             gx, gy = self.goal_xy
         else:
@@ -237,14 +211,12 @@ class VrpnPerception:
             t=now,
             dog_x=self.dog_xy[0],
             dog_y=self.dog_xy[1],
-            dog_yaw=norm_angle(self.dog_yaw + self.yaw_offset),
+            dog_yaw=self.dog_yaw,
             dog_yaw_x=self.yaw_x,
             dog_yaw_y=self.yaw_y,
             dog_yaw_z=self.yaw_z,
             ball_x=self.ball_xy[0],
             ball_y=self.ball_xy[1],
-            ball_vx=self._ball_vx,
-            ball_vy=self._ball_vy,
             goal_x=gx,
             goal_y=gy,
             goal_from_tracker=goal_from_tracker,

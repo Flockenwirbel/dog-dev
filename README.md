@@ -16,11 +16,13 @@ repo/
 │   ├── start.sh                # 赛方标准启动脚本
 │   └── run_kick_on_dog.sh      # 开发/测试用启动脚本
 ├── Keeper/                 # 守门员 (部署到 dog2)
-│   ├── run_goalkeeper.py       # 主节点: 守门状态机
-│   ├── goalkeeper_controller.py # 扑救控制器
+│   ├── goalkeeper.py           # 主节点: 走到球门前站位
 │   ├── goal_line_patrol.py     # 门线巡逻
+│   ├── walk_to_goal.py         # 走到目标点
+│   ├── diag.py                 # 诊断工具
 │   ├── vrpn_perception.py      # VRPN 动捕感知
-│   └── setup.py                # ROS 2 包配置 (entry: goalkeeper)
+│   ├── setup.py                # ROS 2 包配置 (package: goalkeeper_pkg)
+│   └── start.sh                # 赛方标准启动脚本
 └── README.md
 ```
 
@@ -34,13 +36,20 @@ repo/
 
 ### 工作空间路径
 
-代码放入每只狗的 `~/ros2_ws/src/demo_python_pkg/demo_python_pkg/`。
-`setup.py` 和 `package.xml` 放在 `~/ros2_ws/src/demo_python_pkg/`。
+- **Goaler**: 代码放入 `~/ros2_ws/src/demo_python_pkg/demo_python_pkg/`
+- **Keeper**: 代码放入 `~/goalkeeper_ws/src/goalkeeper_pkg/goalkeeper_pkg/`
+
+`setup.py` 和 `package.xml` 放在包根目录下。
 
 ```bash
 # 编译
+# Goaler
 cd ~/ros2_ws
 colcon build --packages-select demo_python_pkg
+
+# Keeper
+cd ~/goalkeeper_ws
+colcon build --packages-select goalkeeper_pkg
 ```
 
 ### VRPN 提前启动
@@ -63,7 +72,7 @@ cd /home/mi && ./start.sh dog1 goal_right   # 或 goal_left
 
 # 守门员 (dog2)
 ssh mi@<狗2IP>
-cd /home/mi && ./start.sh dog2 goal_left    # 或 goal_right
+cd /home/mi && ./start.sh dog2 goal_right   # 或 goal_left
 ```
 
 ## 前锋状态机
@@ -106,7 +115,8 @@ APPROACH → ALIGN_KICK → DASH (持续)
 
 ## 守门员
 
-状态机包含门线巡逻、球追踪、扑救等逻辑。详见 `Keeper/run_goalkeeper.py`。
+Keeper 位于独立的 `goalkeeper_ws` 工作空间，包名为 `goalkeeper_pkg`。
+入口点 `gk`，启动后走到球门前 0.3m 处站位，面朝来球方向。
 
 ## LCM 层说明
 

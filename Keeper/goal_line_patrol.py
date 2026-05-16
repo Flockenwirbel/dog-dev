@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""Goal-line patrol: dog moves left-right along the goal line using VRPN motion capture."""
+"""Goalkeeper: stand 30cm in front of goal, body parallel to goal line, track ball along X."""
 
 import math
 import time
-from typing import Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from protocol.msg import MotionServoCmd
+from protocol.srv import MotionResultCmd
+
+
+DOG_NAMESPACE = "mi_desktop_48_b0_2d_7b_06_3f"
+
+GOAL_HALF_WIDTH = 0.75    # meters, goal total width ~1.5m
+GOAL_DISTANCE = 0.3       # meters, dog stays 30cm from goal
+KP = 0.8                  # proportional gain for position
+YAW_GAIN = 0.5
+MAX_SPEED = 0.25          # m/s, within slow walk limits (vx=0.65, vy=0.3)
+MAX_YAW_RATE = 0.5        # rad/s, within slow walk limit (1.25)
 
 
 def clamp(v, lo, hi):
@@ -23,26 +33,11 @@ def norm_angle(rad):
     return rad
 
 
-class GoalLinePatrol(Node):
+class Goalkeeper(Node):
     def __init__(self):
-        super().__init__("goal_line_patrol")
+        super().__init__("goalkeeper")
 
-        # ---- Configurable parameters ----
-        self.declare_parameter("ball_tracker", "ball")
-        self.declare_parameter("dog_tracker", "LYT")
-        self.declare_parameter("goal_tracker", "goal_right")
-        self.declare_parameter("patrol_speed", 0.2)
-        self.declare_parameter("patrol_range", 1.0)
-        self.declare_parameter("y_threshold", 0.1)
-        self.declare_parameter("yaw_gain", 0.5)
-        self.declare_parameter("max_yaw_rate", 0.5)
-        self.declare_parameter("face_ball", True)
-
-        ball_tracker = self.get_parameter("ball_tracker").value
-        dog_tracker = self.get_parameter("dog_tracker").value
-        goal_tracker = self.get_parameter("goal_tracker").value
-
-        # ---- VRPN subscriptions ----
+        # VRPN state
         self.ball_xy = None
         self.goal_xy = None
         self.dog_xy = None
@@ -50,44 +45,47 @@ class GoalLinePatrol(Node):
         self.ball_t = 0.0
         self.goal_t = 0.0
         self.dog_t = 0.0
+        self.field_sign = None  # +1 if field in +Y, -1 if in -Y
 
+        # VRPN subscriptions
         self.create_subscription(
-            PoseStamped, f"/vrpn/{ball_tracker}/pose", self._on_ball, 10
+            PoseStamped, "/vrpn/ball/pose", self._on_ball, 10
         )
         self.create_subscription(
-            PoseStamped, f"/vrpn/{goal_tracker}/pose", self._on_goal, 10
+            PoseStamped, "/vrpn/goal_right/pose", self._on_goal, 10
         )
         self.create_subscription(
-            PoseStamped, f"/vrpn/{dog_tracker}/pose", self._on_dog, 10
+            PoseStamped, "/vrpn/LYT/pose", self._on_dog, 10
         )
 
-        # ---- Motion command publisher ----
-        ns = self._get_namespace()
+        # Motion servo command publisher
         self.cmd_pub = self.create_publisher(
-            MotionServoCmd, f"/{ns}/motion_servo_cmd", 10
+            MotionServoCmd,
+            "/{}/motion_servo_cmd".format(DOG_NAMESPACE),
+            10
         )
 
-        # ---- Patrol state ----
-        self.patrol_dir = 1  # +1 = move right, -1 = move left
+        # Stand-up service client
+        self.stand_client = self.create_client(
+            MotionResultCmd,
+            "/{}/motion_result_cmd".format(DOG_NAMESPACE)
+        )
 
-        # ---- Control loop at 10 Hz ----
+        self.get_logger().info("Waiting for stand-up service...")
+        self.stand_client.wait_for_service(timeout_sec=5.0)
+        self.get_logger().info("Sending stand command...")
+        self._stand_up()
+
+        self.start_time = time.monotonic()
         self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Goal-line patrol node started.")
 
-    def _get_namespace(self):
-        import socket
-        import re
+    def _stand_up(self):
+        req = MotionResultCmd.Request()
+        req.motion_id = 111
+        req.cmd_source = 4
+        req.step_height = [0.05, 0.05]
+        self.stand_client.call_async(req)
 
-        hostname = socket.getfqdn(socket.gethostname())
-        try:
-            with open("/sys/class/net/eth0/address") as f:
-                mac = f.read().strip().replace(":", "")
-        except Exception:
-            mac = "00_00_00_00_00_00"
-        namespace = hostname + "_" + mac
-        return re.sub("[^0-9a-zA-Z]+", "_", namespace)
-
-    # ---- VRPN callbacks ----
     def _on_ball(self, msg):
         self.ball_xy = (msg.pose.position.x, msg.pose.position.y)
         self.ball_t = time.monotonic()
@@ -99,74 +97,91 @@ class GoalLinePatrol(Node):
     def _on_dog(self, msg):
         self.dog_xy = (msg.pose.position.x, msg.pose.position.y)
         q = msg.pose.orientation
-        # Yaw from quaternion (rotation about Z axis)
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.dog_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.dog_t = time.monotonic()
 
-    # ---- Main control loop ----
     def control_loop(self):
         now = time.monotonic()
+        if now - self.start_time < 3.0:
+            return
 
-        # Check data freshness
         if self.dog_xy is None or self.dog_yaw is None:
             self.get_logger().warn("Waiting for dog VRPN data...")
             return
         if self.goal_xy is None:
             self.get_logger().warn("Waiting for goal VRPN data...")
             return
-
         if now - self.dog_t > 2.0:
             self.get_logger().warn("Dog data stale, stopping.")
-            self._send_cmd(0.0, 0.0, 0.0)
+            self._send_servo(0.0, 0.0, 0.0)
             return
 
         dog_x, dog_y = self.dog_xy
         dog_yaw = self.dog_yaw
         goal_x, goal_y = self.goal_xy
 
-        patrol_speed = self.get_parameter("patrol_speed").value
-        patrol_range = self.get_parameter("patrol_range").value
-        y_threshold = self.get_parameter("y_threshold").value
-
-        # Patrol along the goal line (perpendicular to the goal-to-field direction)
-        # The goal line is perpendicular to the vector from goal center to field center.
-        # Here we simply patrol along the Y-axis relative to the goal position.
-
-        # Calculate distance from dog to goal along the patrol axis (Y)
-        lateral_offset = dog_y - goal_y
-
-        # Reverse direction when reaching patrol range limits
-        if lateral_offset > patrol_range:
-            self.patrol_dir = -1
-        elif lateral_offset < -patrol_range:
-            self.patrol_dir = 1
-
-        # Lateral velocity command (in body frame, vy = lateral movement)
-        vy = self.patrol_dir * patrol_speed
-
-        # If ball data is available, face the ball; otherwise face forward
-        vyaw = 0.0
-        if self.ball_xy is not None and now - self.ball_t < 2.0:
+        # Determine field direction: ball is on the field side of the goal
+        if self.ball_xy is not None and now - self.ball_t < 5.0:
             ball_x, ball_y = self.ball_xy
-            desired_yaw = math.atan2(ball_y - dog_y, ball_x - dog_x)
-            yaw_error = norm_angle(desired_yaw - dog_yaw)
-            yaw_gain = self.get_parameter("yaw_gain").value
-            max_yaw_rate = self.get_parameter("max_yaw_rate").value
-            vyaw = clamp(yaw_gain * yaw_error, -max_yaw_rate, max_yaw_rate)
+            if ball_y >= goal_y:
+                self.field_sign = 1
+            else:
+                self.field_sign = -1
+        if self.field_sign is None:
+            self.field_sign = 1
 
-        self._send_cmd(0.0, vy, vyaw)
+        # Target X: track ball, clamped to goal range
+        if self.ball_xy is not None and now - self.ball_t < 2.0:
+            target_x = clamp(self.ball_xy[0],
+                             goal_x - GOAL_HALF_WIDTH,
+                             goal_x + GOAL_HALF_WIDTH)
+        else:
+            target_x = goal_x
+
+        # Target Y: 30cm from goal on the field side
+        target_y = goal_y + self.field_sign * GOAL_DISTANCE
+
+        # Desired yaw: face the field (perpendicular to goal line)
+        # +pi/2 means facing +Y, -pi/2 means facing -Y
+        desired_yaw = (math.pi / 2.0) * self.field_sign
+
+        # Position errors in world frame
+        dx = target_x - dog_x
+        dy = target_y - dog_y
+
+        # World-frame velocities (P control)
+        world_vx = KP * dx
+        world_vy = KP * dy
+
+        # Clamp world velocities
+        world_vx = clamp(world_vx, -MAX_SPEED, MAX_SPEED)
+        world_vy = clamp(world_vy, -MAX_SPEED, MAX_SPEED)
+
+        # Transform to body frame
+        cos_yaw = math.cos(dog_yaw)
+        sin_yaw = math.sin(dog_yaw)
+        body_vx = world_vx * cos_yaw + world_vy * sin_yaw
+        body_vy = -world_vx * sin_yaw + world_vy * cos_yaw
+
+        # Yaw control
+        yaw_error = norm_angle(desired_yaw - dog_yaw)
+        vyaw = clamp(YAW_GAIN * yaw_error, -MAX_YAW_RATE, MAX_YAW_RATE)
+
+        self._send_servo(body_vx, body_vy, vyaw)
 
         self.get_logger().info(
-            f"dog=({dog_x:.2f},{dog_y:.2f}) goal=({goal_x:.2f},{goal_y:.2f}) "
-            f"lateral={lateral_offset:.2f} dir={self.patrol_dir} vy={vy:.2f} vyaw={vyaw:.2f}"
+            "target=({:.2f},{:.2f}) dog=({:.2f},{:.2f}) dx={:.2f} dy={:.2f} bv=({:.2f},{:.2f}) vyaw={:.2f}".format(
+                target_x, target_y, dog_x, dog_y, dx, dy, body_vx, body_vy, vyaw
+            )
         )
 
-    def _send_cmd(self, vx, vy, vyaw):
+    def _send_servo(self, vx, vy, vyaw):
         cmd = MotionServoCmd()
         cmd.motion_id = 303
         cmd.cmd_type = 1
+        cmd.cmd_source = 4
         cmd.value = 2
         cmd.vel_des = [float(vx), float(vy), float(vyaw)]
         cmd.step_height = [0.05, 0.05]
@@ -175,7 +190,7 @@ class GoalLinePatrol(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GoalLinePatrol()
+    node = Goalkeeper()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

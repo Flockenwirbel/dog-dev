@@ -42,8 +42,8 @@ source /opt/ros2/galactic/setup.bash 2>/dev/null
 source /opt/ros2/cyberdog/local_setup.bash 2>/dev/null
 source /home/mi/vrpn_client_ros2/src/install/setup.bash 2>/dev/null
 
-# 策略代码工作空间
-source /home/mi/ros2_ws/install/setup.bash 2>/dev/null
+# Keeper 工作空间
+source /home/mi/goalkeeper_ws/install/setup.bash 2>/dev/null
 
 # ============================================
 # 2. 启动守门员
@@ -56,4 +56,4 @@ echo "  Press Ctrl+C to stop"
 echo "========================================"
 echo ""
 
-DOG_NAME=${DOG} ros2 run demo_python_pkg goalkeeper --ros-args -p goal_tracker:=${GOAL}
+DOG_NAME=${DOG} ros2 run goalkeeper_pkg gk --ros-args -p goal_tracker:=${GOAL}
