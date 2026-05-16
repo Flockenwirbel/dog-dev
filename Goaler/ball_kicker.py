@@ -19,6 +19,7 @@ try:
         CMD_DATA,
         GAIT_STANDARD,
         MEDIUM_TROT,
+        SLOW_TROT,
         MotionCmd,
         PerceptionSnapshot,
         VrpnPerception,
@@ -32,6 +33,7 @@ except ImportError:
         CMD_DATA,
         GAIT_STANDARD,
         MEDIUM_TROT,
+        SLOW_TROT,
         MotionCmd,
         PerceptionSnapshot,
         VrpnPerception,
@@ -44,6 +46,7 @@ class BallKicker(Node):
     ALIGN_KICK = "align_kick"
     DASH = "dash"
     COOLDOWN = "cooldown"
+    WAITING = "waiting"
 
     def __init__(self) -> None:
         super().__init__("ball_kicker")
@@ -98,7 +101,8 @@ class BallKicker(Node):
         self.declare_parameter("dash_stop_goal_dist", 0.50)
         self.declare_parameter("align_timeout", 6.0)
         self.declare_parameter("approach_timeout", 30.0)
-        self.declare_parameter("cooldown_duration", 2.0)
+        self.declare_parameter("cooldown_duration", 0.8)
+        self.declare_parameter("cooldown_dash_time", 1.0)
 
         p = self.get_parameter
         self.dog_name = p("dog_name").value
@@ -111,6 +115,7 @@ class BallKicker(Node):
         self.align_timeout = float(p("align_timeout").value)
         self.approach_timeout = float(p("approach_timeout").value)
         self.cooldown_duration = float(p("cooldown_duration").value)
+        self.cooldown_dash_time = float(p("cooldown_dash_time").value)
         self.stop_motion_id = int(p("stop_motion_id").value)
 
         yaw_axis = str(p("forward_yaw_axis").value).lower()
@@ -222,6 +227,9 @@ class BallKicker(Node):
     def _step_in_place(self) -> None:
         self._cmd(MotionCmd(MEDIUM_TROT, 0.0, 0.0, 0.0))
 
+    def _slow_step_in_place(self) -> None:
+        self._cmd(MotionCmd(SLOW_TROT, 0.0, 0.0, 0.0))
+
     def _set_state(self, new_state: str, reason: str) -> None:
         if new_state != self.state:
             self.get_logger().info("state: {} -> {} ({})".format(self.state, new_state, reason))
@@ -286,6 +294,23 @@ class BallKicker(Node):
             return
 
         dist_ball = math.hypot(snapshot.dog_x - snapshot.ball_x, snapshot.dog_y - snapshot.ball_y)
+
+        # Ball past goal laterally — wait instead of chasing
+        if self.state in (self.APPROACH, self.ALIGN_KICK):
+            if abs(snapshot.ball_y) > abs(snapshot.goal_y):
+                self._set_state(self.WAITING, "ball_past_goal")
+                self._slow_step_in_place()
+                self._publish_state(snapshot, {"dist_ball": dist_ball, "waiting": 1.0})
+                return
+
+        if self.state == self.WAITING:
+            if abs(snapshot.ball_y) <= abs(snapshot.goal_y):
+                self.approach.reset()
+                self._set_state(self.APPROACH, "ball_back_in_range")
+                self._publish_state(snapshot, {"dist_ball": dist_ball})
+            else:
+                self._slow_step_in_place()
+            return
 
         if self.state == self.APPROACH:
             if now - self.state_t0 > self.approach_timeout:
@@ -383,30 +408,33 @@ class BallKicker(Node):
             return
 
         if self.state == self.DASH:
+            dt = now - self.state_t0
+
+            # Time-based exit: dash is done after enough time
+            if dt >= self.cooldown_dash_time:
+                self._stand_once()
+                self._set_state(self.COOLDOWN, "dash_timeout")
+                self._publish_state(snapshot, {"dt": dt, "kick_done": 1.0})
+                return
+
             dist_goal = math.hypot(snapshot.dog_x - snapshot.goal_x, snapshot.dog_y - snapshot.goal_y)
             if dist_goal <= self.dash_stop_goal_dist:
                 self._stand_once()
                 self._log("[dash] reached goal ({:.2f}m), standing".format(dist_goal))
+                self._set_state(self.COOLDOWN, "reached_goal")
                 self._publish_state(snapshot, {"dist_goal": dist_goal, "done": 1.0})
                 return
             if dist_ball > 1.50:
-                dt = now - self.state_t0
-                if dt >= self.dash_kicker.dash_duration:
-                    self._set_state(self.COOLDOWN, "kick_done")
-                    self._publish_state(snapshot, {"dist_ball": dist_ball, "kick_done": 1.0})
-                    return
-                else:
-                    self.get_logger().warn(
-                        "Ball lost during dash ({:.2f}m), re-approach".format(dist_ball)
-                    )
-                    self.approach.reset()
-                    self._set_state(self.APPROACH, "ball_lost_during_dash")
-                    self._publish_state(snapshot, {"dist_ball": dist_ball})
-                    return
+                self.get_logger().warn(
+                    "Ball lost during dash ({:.2f}m), re-approach".format(dist_ball)
+                )
+                self.approach.reset()
+                self._set_state(self.APPROACH, "ball_lost_during_dash")
+                self._publish_state(snapshot, {"dist_ball": dist_ball})
+                return
 
             dz = float(self.get_parameter("dash_centroid_z").value)
             dash_cmd = self.dash_kicker.command(snapshot)
-            dt = now - self.state_t0
             if dt < float(self.get_parameter("dash_nudge_duration").value):
                 nudge = float(self.get_parameter("dash_nudge_vy").value)
                 dash_cmd = MotionCmd(dash_cmd.gait, dash_cmd.vx, nudge, dash_cmd.vyaw)
