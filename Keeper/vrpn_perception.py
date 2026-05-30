@@ -84,15 +84,15 @@ class VrpnPerception:
         self.ball_xy = (x, y)
         self.ball_t = now
 
-    def predict_intercept_x(self, goal_y: float) -> Optional[float]:
+    def predict_intercept_x(self, goal_y: float, field_sign: int = 1) -> Optional[float]:
         if self.ball_xy is None:
             return None
         ball_x, ball_y = self.ball_xy
         vy = self.ball_vy
-        if vy >= -0.05:
+        if vy * field_sign >= -0.05:
             return None
         dt = (goal_y - ball_y) / vy
-        if dt <= 0.0 or dt > 1.5:
+        if dt <= 0.0:
             return None
         return ball_x + self.ball_vx * dt
 
