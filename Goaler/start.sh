@@ -53,3 +53,4 @@ echo "========================================"
 echo ""
 
 DOG_NAME=${DOG} ros2 run demo_python_pkg striker --ros-args -p goal_tracker:=${GOAL}
+ros2 run demo_python_pkg sit

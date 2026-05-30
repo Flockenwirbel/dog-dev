@@ -24,6 +24,7 @@ setup(
             "kick = demo_python_pkg.ball_kicker:main",
             "max_forward = demo_python_pkg.max_forward:main",
             "max_spin = demo_python_pkg.max_spin:main",
+            "sit = demo_python_pkg.sit_down:main",
         ],
     },
 )
